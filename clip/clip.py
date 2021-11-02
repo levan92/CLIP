@@ -87,7 +87,7 @@ def available_models() -> List[str]:
     return list(_MODELS.keys())
 
 
-def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit: bool = False, download_root: str = None):
+def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit: bool = False, download_root: str = None, visual_only: bool = False):
     """Load a CLIP model
 
     Parameters
@@ -103,6 +103,9 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
 
     download_root: str
         path to download the model files; by default, it uses "~/.cache/clip"
+
+    visual_only: bool
+        Whether to load image model only, without text model. 
 
     Returns
     -------
@@ -130,8 +133,8 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
             jit = False
         state_dict = torch.load(model_path, map_location="cpu")
 
-    if not jit:
-        model = build_model(state_dict or model.state_dict()).to(device)
+    if visual_only or not jit:
+        model = build_model(state_dict or model.state_dict(), visual_only=visual_only).to(device)
         if str(device) == "cpu":
             model.float()
         return model, _transform(model.visual.input_resolution)
@@ -156,7 +159,8 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
 
     model.apply(patch_device)
     patch_device(model.encode_image)
-    patch_device(model.encode_text)
+    if not visual_only:
+        patch_device(model.encode_text)
 
     # patch dtype to float32 on CPU
     if str(device) == "cpu":
@@ -182,7 +186,8 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
 
         model.apply(patch_float)
         patch_float(model.encode_image)
-        patch_float(model.encode_text)
+        if not visual_only:
+            patch_float(model.encode_text)
 
         model.float()
 

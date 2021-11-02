@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from typing import Tuple, Union
+from warnings import warn
 
 import numpy as np
 import torch
@@ -249,11 +250,13 @@ class CLIP(nn.Module):
                  vocab_size: int,
                  transformer_width: int,
                  transformer_heads: int,
-                 transformer_layers: int
+                 transformer_layers: int,
+                 visual_only=False,
                  ):
         super().__init__()
 
         self.context_length = context_length
+        self.visual_only = visual_only
 
         if isinstance(vision_layers, (tuple, list)):
             vision_heads = vision_width * 32 // 64
@@ -275,26 +278,28 @@ class CLIP(nn.Module):
                 output_dim=embed_dim
             )
 
-        self.transformer = Transformer(
-            width=transformer_width,
-            layers=transformer_layers,
-            heads=transformer_heads,
-            attn_mask=self.build_attention_mask()
-        )
+        if not visual_only:
+            self.transformer = Transformer(
+                width=transformer_width,
+                layers=transformer_layers,
+                heads=transformer_heads,
+                attn_mask=self.build_attention_mask()
+            )
 
-        self.vocab_size = vocab_size
-        self.token_embedding = nn.Embedding(vocab_size, transformer_width)
-        self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
-        self.ln_final = LayerNorm(transformer_width)
+            self.vocab_size = vocab_size
+            self.token_embedding = nn.Embedding(vocab_size, transformer_width)
+            self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
+            self.ln_final = LayerNorm(transformer_width)
 
-        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+            self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
+            self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         self.initialize_parameters()
 
     def initialize_parameters(self):
-        nn.init.normal_(self.token_embedding.weight, std=0.02)
-        nn.init.normal_(self.positional_embedding, std=0.01)
+        if not self.visual_only:
+            nn.init.normal_(self.token_embedding.weight, std=0.02)
+            nn.init.normal_(self.positional_embedding, std=0.01)
 
         if isinstance(self.visual, ModifiedResNet):
             if self.visual.attnpool is not None:
@@ -309,17 +314,18 @@ class CLIP(nn.Module):
                     if name.endswith("bn3.weight"):
                         nn.init.zeros_(param)
 
-        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
-        attn_std = self.transformer.width ** -0.5
-        fc_std = (2 * self.transformer.width) ** -0.5
-        for block in self.transformer.resblocks:
-            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+        if not self.visual_only:
+            proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
+            attn_std = self.transformer.width ** -0.5
+            fc_std = (2 * self.transformer.width) ** -0.5
+            for block in self.transformer.resblocks:
+                nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+                nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+                nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+                nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
-        if self.text_projection is not None:
-            nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
+            if self.text_projection is not None:
+                nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -337,6 +343,9 @@ class CLIP(nn.Module):
         return self.visual(image.type(self.dtype))
 
     def encode_text(self, text):
+        if self.visual_only:
+            warn('Model only has visual model loaded, please set visual_only to False if you need text model.')
+            return
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
@@ -353,19 +362,21 @@ class CLIP(nn.Module):
 
     def forward(self, image, text):
         image_features = self.encode_image(image)
-        text_features = self.encode_text(text)
-
-        # normalized features
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        if not self.visual_only:
+            text_features = self.encode_text(text)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
         # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
         logits_per_image = logit_scale * image_features @ text_features.t()
-        logits_per_text = logits_per_image.t()
 
-        # shape = [global_batch_size, global_batch_size]
-        return logits_per_image, logits_per_text
+        if not self.visual_only:
+            logits_per_text = logits_per_image.t()
+            return logits_per_image, logits_per_text
+        else: 
+            return logits_per_image
 
 
 def convert_weights(model: nn.Module):
@@ -392,7 +403,7 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict):
+def build_model(state_dict: dict, visual_only=False):
     vit = "visual.proj" in state_dict
 
     if vit:
@@ -411,21 +422,33 @@ def build_model(state_dict: dict):
         image_resolution = output_width * 32
 
     embed_dim = state_dict["text_projection"].shape[1]
-    context_length = state_dict["positional_embedding"].shape[0]
-    vocab_size = state_dict["token_embedding.weight"].shape[0]
-    transformer_width = state_dict["ln_final.weight"].shape[0]
-    transformer_heads = transformer_width // 64
-    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
+    if not visual_only:
+        context_length = state_dict["positional_embedding"].shape[0]
+        vocab_size = state_dict["token_embedding.weight"].shape[0]
+        transformer_width = state_dict["ln_final.weight"].shape[0]
+        transformer_heads = transformer_width // 64
+        transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
+    else: 
+        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers = None, None, None, None, None
 
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
+        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers,
+        visual_only=visual_only
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:
             del state_dict[key]
+    
+    if visual_only: 
+        transformer_keys = [key for key in state_dict if 'visual.' not in key and 'transformer.' in key]
+        for key in transformer_keys: 
+            del state_dict[key]
+        for key in ["positional_embedding", "text_projection", "logit_scale", "token_embedding.weight", "ln_final.weight", "ln_final.bias"]:
+            if key in state_dict:
+                del state_dict[key]
 
     convert_weights(model)
     model.load_state_dict(state_dict)
